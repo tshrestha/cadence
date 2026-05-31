@@ -88,6 +88,7 @@ import "./style.css";
     if (b === state.bpm) return;
     state.bpm = b;
     renderTempo();
+    if (state.playing) scheduleLoopRebuild();   // coalesces rapid changes (drag / tap)
     if (!fromDrag && navigator.vibrate && state.vibrate) navigator.vibrate(8);
   }
 
@@ -173,48 +174,68 @@ import "./style.css";
   }
 
   // ═════════════════════════ AUDIO ENGINE ═════════════════════════
-  // Lookahead scheduler (Web Audio clock) + Web Worker timer so it
-  // keeps perfect time even when the tab is throttled in the background.
-  let ctx = null, master = null, noiseBuf = null;
-  let nextNoteTime = 0, beatNumber = 0;
-  const SCHEDULE_AHEAD = 0.12;        // seconds scheduled in advance
-  const visualQ = [];                  // {time, accent} pending visual flashes
-
-  const workerSrc = `let t=null,iv=25;onmessage=e=>{const d=e.data;` +
-    `if(d==='start'){t=setInterval(()=>postMessage(0),iv);}` +
-    `else if(d==='stop'){clearInterval(t);t=null;}};`;
-  const timerWorker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: "text/javascript" })));
-  timerWorker.onmessage = () => { if (state.playing) scheduler(); };
+  // iOS suspends the AudioContext AND freezes JS timers when the screen
+  // locks, so a timer-driven note scheduler dies in the background. Instead
+  // we bake one accent-period of audio into a buffer and play it on a
+  // *looping* AudioBufferSourceNode — the loop runs in the audio engine with
+  // zero JS per beat. To stop iOS from suspending the context, the output is
+  // routed into a hidden <audio> element (via a MediaStream); an actively
+  // playing media element keeps the audio session alive with the screen off.
+  let ctx = null, master = null, streamDest = null, keepAudio = null, loopSource = null;
+  let phaseBeats = 0, phaseTime = 0, phaseBeatDur = 60 / DEFAULT_BPM, lastBeatShown = -1;
+  let loopRebuildTO = null, rafId = null, mediaSessionInit = false;
+  const clickCache = new Map();   // `${sound}:${accent}` → Float32Array of one click
 
   function initAudio() {
     if (ctx) return;
     ctx = new (window.AudioContext || window.webkitAudioContext)();
     master = ctx.createGain();
     master.gain.value = state.volume;
-    master.connect(ctx.destination);
-    // noise buffer for the "wood" click
-    const len = Math.floor(ctx.sampleRate * 0.05);
-    noiseBuf = ctx.createBuffer(1, len, ctx.sampleRate);
-    const d = noiseBuf.getChannelData(0);
-    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+
+    // The metronome is heard through this media element, NOT ctx.destination —
+    // that is what lets it keep playing while the iPhone is locked.
+    streamDest = ctx.createMediaStreamDestination();
+    master.connect(streamDest);
+    keepAudio = document.createElement("audio");
+    keepAudio.srcObject = streamDest.stream;
+    keepAudio.setAttribute("playsinline", "");
+    keepAudio.setAttribute("webkit-playsinline", "");
+    keepAudio.style.display = "none";
+    document.body.appendChild(keepAudio);
+
+    // If iOS pauses the element on an interruption, resume it while running.
+    keepAudio.addEventListener("pause", () => {
+      if (state.playing) { ctx.resume().catch(() => {}); keepAudio.play().catch(() => {}); }
+    });
+    if (ctx.addEventListener) {
+      ctx.addEventListener("statechange", () => {
+        if (state.playing && ctx.state !== "running") ctx.resume().catch(() => {});
+      });
+    }
   }
 
-  function clickVoice(time, accent) {
-    if (state.sound === "off") return;
-    const g = ctx.createGain();
-    g.connect(master);
+  // Render a single click into a Float32Array, reusing the exact synth voices
+  // (oscillator / band-passed noise) via an OfflineAudioContext.
+  function voiceInto(ac, dest, time, sound, accent) {
+    if (sound === "off") return;
+    const g = ac.createGain();
+    g.connect(dest);
     const peak = accent ? 1 : 0.7;
-    if (state.sound === "wood") {
-      const src = ctx.createBufferSource(); src.buffer = noiseBuf;
-      const bp = ctx.createBiquadFilter(); bp.type = "bandpass";
+    if (sound === "wood") {
+      const len = Math.floor(ac.sampleRate * 0.05);
+      const nb = ac.createBuffer(1, len, ac.sampleRate);
+      const d = nb.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      const src = ac.createBufferSource(); src.buffer = nb;
+      const bp = ac.createBiquadFilter(); bp.type = "bandpass";
       bp.frequency.value = accent ? 2600 : 1800; bp.Q.value = 7;
       src.connect(bp); bp.connect(g);
       g.gain.setValueAtTime(peak, time);
       g.gain.exponentialRampToValueAtTime(0.0001, time + 0.035);
       src.start(time); src.stop(time + 0.05);
     } else {
-      const osc = ctx.createOscillator();
-      const beep = state.sound === "beep";
+      const osc = ac.createOscillator();
+      const beep = sound === "beep";
       osc.type = beep ? "sine" : "triangle";
       osc.frequency.value = accent ? (beep ? 1320 : 1600) : (beep ? 880 : 1050);
       osc.connect(g);
@@ -225,28 +246,91 @@ import "./style.css";
     }
   }
 
-  function scheduler() {
-    while (nextNoteTime < ctx.currentTime + SCHEDULE_AHEAD) {
-      const accent = state.accent > 0 && beatNumber % state.accent === 0;
-      clickVoice(nextNoteTime, accent);
-      visualQ.push({ time: nextNoteTime, accent });
-      nextNoteTime += 60 / state.bpm;     // reads live bpm → smooth tempo changes
-      beatNumber++;
+  async function renderClick(sound, accent) {
+    const sr = ctx.sampleRate;
+    const oac = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(
+      1, Math.ceil(0.13 * sr), sr
+    );
+    voiceInto(oac, oac.destination, 0, sound, accent);
+    const rendered = await oac.startRendering();
+    return rendered.getChannelData(0).slice();
+  }
+
+  // Ensure both accent variants of a sound are cached (one-time per sound).
+  async function ensureClicks(sound) {
+    if (sound === "off") return;
+    for (const accent of [false, true]) {
+      const key = sound + ":" + (accent ? 1 : 0);
+      if (!clickCache.has(key)) clickCache.set(key, await renderClick(sound, accent));
     }
   }
 
+  // Bake one loop period (1 beat, or `accent` beats when accents are on).
+  function buildLoopBuffer() {
+    const beatDur = 60 / state.bpm;
+    const beats = state.accent > 0 ? state.accent : 1;
+    const sr = ctx.sampleRate;
+    const len = Math.max(1, Math.round(beatDur * beats * sr));
+    const buf = ctx.createBuffer(1, len, sr);
+    const out = buf.getChannelData(0);
+    if (state.sound !== "off") {
+      for (let i = 0; i < beats; i++) {
+        const isAccent = state.accent > 0 && i === 0;
+        const click = clickCache.get(state.sound + ":" + (isAccent ? 1 : 0));
+        if (!click) continue;
+        const off = Math.round(i * beatDur * sr);
+        for (let j = 0; j < click.length && off + j < len; j++) out[off + j] += click[j];
+      }
+    }
+    return buf;
+  }
+
+  function currentBeats() {
+    if (!phaseTime) return 0;
+    return phaseBeats + Math.max(0, ctx.currentTime - phaseTime) / phaseBeatDur;
+  }
+
+  // (Re)start the looping source, preserving the running beat count.
+  function restartLoop() {
+    const startBeats = state.playing ? Math.floor(currentBeats()) : 0;
+    if (loopSource) {
+      try { loopSource.stop(); } catch (e) {}
+      try { loopSource.disconnect(); } catch (e) {}
+    }
+    loopSource = ctx.createBufferSource();
+    loopSource.buffer = buildLoopBuffer();
+    loopSource.loop = true;
+    loopSource.connect(master);
+    const t0 = ctx.currentTime + 0.06;
+    loopSource.start(t0);
+    phaseBeats = startBeats;
+    phaseTime = t0;
+    phaseBeatDur = 60 / state.bpm;
+  }
+
+  function scheduleLoopRebuild() {
+    if (!state.playing || loopRebuildTO) return;
+    loopRebuildTO = setTimeout(() => { loopRebuildTO = null; if (state.playing) restartLoop(); }, 90);
+  }
+
   // ───────────────────────── visual beat sync ─────────────────────────
+  // Driven off the audio clock, so the step count stays correct even after
+  // the screen was off (rAF is paused in the background, then catches up).
+  function ensureVisualLoop() {
+    if (rafId == null && state.playing) rafId = requestAnimationFrame(visualLoop);
+  }
   function visualLoop() {
+    rafId = null;
     if (!state.playing) return;
-    const now = ctx.currentTime;
-    while (visualQ.length && visualQ[0].time <= now) {
-      visualQ.shift();
+    const cur = Math.floor(currentBeats());
+    if (cur > lastBeatShown) {
+      lastBeatShown = cur;
+      state.steps = cur;
       flashBeat();
-      state.steps++;
     }
     if (state.startedAt) elapsedEl.textContent = fmtTime(performance.now() - state.startedAt);
     updateStats();
-    requestAnimationFrame(visualLoop);
+    rafId = requestAnimationFrame(visualLoop);
   }
   let flashTO;
   function flashBeat() {
@@ -256,25 +340,52 @@ import "./style.css";
     if (state.vibrate && navigator.vibrate) navigator.vibrate(12);
   }
 
+  // ───────────────────────── media session (lock-screen + background) ─────────────────────────
+  function setMediaSession(playing) {
+    if (!("mediaSession" in navigator)) return;
+    try {
+      if (!mediaSessionInit) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: "Cadence",
+          artist: "Running cadence metronome",
+          artwork: [{ src: "icon.svg", sizes: "512x512", type: "image/svg+xml" }],
+        });
+        navigator.mediaSession.setActionHandler("play", () => { if (!state.playing) start(); });
+        navigator.mediaSession.setActionHandler("pause", () => { if (state.playing) stop(); });
+        navigator.mediaSession.setActionHandler("stop", () => { if (state.playing) stop(); });
+        mediaSessionInit = true;
+      }
+      navigator.mediaSession.playbackState = playing ? "playing" : "paused";
+    } catch (e) {}
+  }
+
   // ───────────────────────── transport ─────────────────────────
   async function start() {
     initAudio();
-    if (ctx.state === "suspended") await ctx.resume();
+    if (ctx.state !== "running") { try { await ctx.resume(); } catch (e) {} }
+    await ensureClicks(state.sound);
     state.playing = true;
     state.steps = 0;
     state.startedAt = performance.now();
-    beatNumber = 0;
-    visualQ.length = 0;
-    nextNoteTime = ctx.currentTime + 0.06;
-    timerWorker.postMessage("start");
-    requestAnimationFrame(visualLoop);
+    lastBeatShown = -1;
+    phaseBeats = 0; phaseTime = 0;
+    restartLoop();
+    try { await keepAudio.play(); } catch (e) {}
+    setMediaSession(true);
+    ensureVisualLoop();
     playBtn.classList.add("running");
     playLabel.textContent = "Stop";
     requestWakeLock();
   }
   function stop() {
     state.playing = false;
-    timerWorker.postMessage("stop");
+    if (loopSource) {
+      try { loopSource.stop(); } catch (e) {}
+      try { loopSource.disconnect(); } catch (e) {}
+      loopSource = null;
+    }
+    if (keepAudio) { try { keepAudio.pause(); } catch (e) {} }
+    setMediaSession(false);
     playBtn.classList.remove("running");
     playLabel.textContent = "Start";
     bpmEl.classList.remove("beat");
@@ -290,8 +401,11 @@ import "./style.css";
   }
   function releaseWakeLock() { if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; } }
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") {
-      if (state.playing) { requestWakeLock(); if (ctx && ctx.state === "suspended") ctx.resume(); }
+    if (document.visibilityState === "visible" && state.playing) {
+      requestWakeLock();
+      if (ctx && ctx.state !== "running") ctx.resume().catch(() => {});
+      if (keepAudio && keepAudio.paused) keepAudio.play().catch(() => {});
+      ensureVisualLoop();
     }
   });
 
@@ -302,17 +416,20 @@ import "./style.css";
   $("settingsBtn").addEventListener("click", openSheet);
   scrim.addEventListener("click", closeSheet);
 
-  function wireSeg(id, key, parse) {
+  function wireSeg(id, key, parse, after) {
     const seg = $(id);
     seg.addEventListener("click", (e) => {
       const btn = e.target.closest("button"); if (!btn) return;
       [...seg.children].forEach((b) => b.classList.toggle("on", b === btn));
       state[key] = parse(btn.dataset.v);
       persist();
+      if (after) after();
     });
   }
-  wireSeg("soundSeg", "sound", (v) => v);
-  wireSeg("accentSeg", "accent", (v) => +v);
+  wireSeg("soundSeg", "sound", (v) => v, async () => {
+    if (state.playing) { await ensureClicks(state.sound); restartLoop(); }
+  });
+  wireSeg("accentSeg", "accent", (v) => +v, () => { if (state.playing) restartLoop(); });
 
   function wireToggle(id, key) {
     const el = $(id);
