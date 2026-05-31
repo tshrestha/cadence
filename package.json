@@ -1,0 +1,16 @@
+{
+  "name": "cadence",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "A highly accurate, lightweight metronome for running cadence.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^8.0.14",
+    "vite-plugin-pwa": "^1.3.0"
+  }
+}

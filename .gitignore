@@ -1,0 +1,9 @@
+node_modules
+dist
+dev-dist
+*.local
+*.log
+.DS_Store
+
+# Local npm cache redirect (works around a root-owned ~/.npm on this machine)
+.npmrc
