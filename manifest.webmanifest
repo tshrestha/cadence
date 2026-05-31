@@ -1,0 +1,14 @@
+{
+  "name": "Cadence — Running Metronome",
+  "short_name": "Cadence",
+  "description": "A highly accurate, lightweight metronome for running cadence.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#08090a",
+  "theme_color": "#08090a",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
