@@ -89,6 +89,7 @@ import "./style.css";
     state.bpm = b;
     renderTempo();
     if (state.playing) scheduleLoopRebuild();   // coalesces rapid changes (drag / tap)
+    persistSoon();                              // remember the chosen tempo
     if (!fromDrag && navigator.vibrate && state.vibrate) navigator.vibrate(8);
   }
 
@@ -463,6 +464,16 @@ import "./style.css";
       }));
     } catch (e) {}
   }
+  // Debounced save so dragging the dial doesn't hammer localStorage every frame.
+  let persistTO;
+  function persistSoon() { clearTimeout(persistTO); persistTO = setTimeout(persist, 250); }
+  // Flush any pending save when the app is backgrounded or closed, so the last
+  // tempo/setting survives even if iOS suspends us before the debounce fires.
+  function flushPersist() { clearTimeout(persistTO); persist(); }
+  window.addEventListener("pagehide", flushPersist);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushPersist();
+  });
   function restore() {
     let s; try { s = JSON.parse(localStorage.getItem("cadence")); } catch (e) {}
     if (!s) return;
@@ -483,10 +494,20 @@ import "./style.css";
     else if (e.code === "ArrowDown" || e.code === "ArrowLeft") setBpm(state.bpm - 1);
   });
 
+  // Ask the browser to keep our storage from being evicted (iOS/Safari will
+  // otherwise clear a web app's localStorage after ~7 days of non-use).
+  function requestPersistentStorage() {
+    if (!navigator.storage || !navigator.storage.persist) return;
+    navigator.storage.persisted()
+      .then((already) => { if (!already) return navigator.storage.persist(); })
+      .catch(() => {});
+  }
+
   // ───────────────────────── boot ─────────────────────────
   restore();
   renderTempo();
   elapsedEl.textContent = "00:00";
+  requestPersistentStorage();
 
   // Service worker is registered automatically by vite-plugin-pwa.
 })();
